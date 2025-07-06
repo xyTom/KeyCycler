@@ -5,6 +5,9 @@ const MAX_SCAN_KEYS = 15;                                      // 子请求安�
 
 export default {
   async fetch(req, env, ctx) {
+    // 克隆请求体，避免多次使用时被消费
+    const requestBody = req.body ? await req.arrayBuffer() : null;
+    
     // 随机平移窗口，均匀利用所有 Key
     const offset = Math.floor(Math.random() * ALL_KEYS.length);
     console.log(`Starting key rotation with offset: ${offset}, total keys: ${ALL_KEYS.length}`);
@@ -12,29 +15,32 @@ export default {
     let scanned = 0;
     for (let i = 0; scanned < MAX_SCAN_KEYS && i < ALL_KEYS.length; i++, scanned++) {
       const key = ALL_KEYS[(offset + i) % ALL_KEYS.length];
-      console.log(`Trying key ${scanned + 1}/${MAX_SCAN_KEYS}: ${key.slice(0, 10)}...`);
+      console.log(`Trying key ${scanned + 1}/${MAX_SCAN_KEYS}: ${key.slice(0, 20)}...`);
       
       /* ---------- ① 查 KV，看是否在冷却 ---------- */
       try {
         if (await env.COOL.get(key)) {
-          console.log(`Key ${key.slice(0, 10)}... is cooling, skipping`);
+          console.log(`Key ${key.slice(0, 20)}... is cooling, skipping`);
           continue;
         }
       } catch (error) {
-        console.error(`Error checking KV for key ${key.slice(0, 10)}...:`, error.message);
+        console.error(`Error checking KV for key ${key.slice(0, 20)}...:`, error.message);
         continue;
       }
 
       /* ---------- ② 调用 OpenAI ---------- */
-      console.log(`Calling OpenAI with key ${key.slice(0, 10)}...`);
-      const up = await callOpenAI(req, key);
-      console.log(`OpenAI response status: ${up.status}`);
+      console.log(`Calling OpenAI with key ${key.slice(0, 20)}...`);
+      const up = await callOpenAI(req, key, requestBody);
+      console.log(`OpenAI response status: ${up.status} for key ${key.slice(0, 10)}...`);
       
-      if (up.status !== 429) return mirrorHeaders(up);         // 成功，直接返回流式响应
+      if (up.status !== 429) {
+        console.log(`Returning response with status ${up.status}, scan completed`);
+        return mirrorHeaders(up);         // 成功，直接返回流式响应
+      }
 
       /* ---------- ③ 触发限流：写 KV 并设置 TTL ---------- */
       const ttl = calcTtl(up);                                 // 秒
-      console.log(`Key ${key.slice(0, 10)}... hit rate limit, cooling for ${ttl}s`);
+      console.log(`Key ${key.slice(0, 20)}... hit rate limit, cooling for ${ttl}s`);
       ctx.waitUntil(env.COOL.put(key, 'cooling', { expirationTtl: ttl }));
     }
 
@@ -72,14 +78,16 @@ function mirrorHeaders(up) {
   return out;
 }
 
-async function callOpenAI(orig, key) {
+async function callOpenAI(orig, key, requestBody) {
   const url = new URL(orig.url);
-  url.hostname = 'api.openai.com';
+  url.hostname = 'gateway.ai.cloudflare.com';
+  // Cloudflare AI Gateway 格式：保留完整的原始路径
+  url.pathname = `/v1/84d85b35ee225a9bcc9f41df796aacb9/openai-worker/openai${url.pathname}`;
 
   const init = {
     method: orig.method,
     headers: new Headers(orig.headers),
-    body: orig.body,
+    body: requestBody, // 使用预先读取的请求体
     cf: { cacheEverything: false }
   };
 
