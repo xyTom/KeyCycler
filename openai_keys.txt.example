@@ -1,0 +1,14 @@
+# OpenAI Keys 示例文件
+# 请将此文件重命名为 openai_keys.txt 并填入你的真实 API Keys
+# 每行一个 Key，支持空行和注释
+
+# 示例 Keys（请替换为你的真实 Keys）
+sk-your-openai-key-1
+sk-your-openai-key-2
+sk-your-openai-key-3
+sk-your-openai-key-4
+sk-your-openai-key-5
+
+# 更多 Keys...
+# sk-your-openai-key-6
+# sk-your-openai-key-7

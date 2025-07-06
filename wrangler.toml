@@ -1,0 +1,7 @@
+name = "openai-key-cycler"
+main = "src/worker.js"
+compatibility_date = "2025-07-05"
+
+[[kv_namespaces]]
+binding = "COOL"
+id      = "12f7af5ddd1944f1932c8533c42f339c"

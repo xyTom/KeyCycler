@@ -1,0 +1,24 @@
+{
+  "name": "key-cycler",
+  "version": "1.0.0",
+  "description": "API Key Cycler with Cloudflare Workers KV",
+  "main": "src/worker.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "kv:create": "wrangler kv namespace create KEY-CYCLER-COOL-DOWN-POOL",
+    "kv:create-preview": "wrangler kv namespace create KEY-CYCLER-COOL-DOWN-POOL --preview"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "openai",
+    "key-rotation",
+    "kv"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "wrangler": "^4.23.0"
+  }
+}
