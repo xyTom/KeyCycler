@@ -51,12 +51,12 @@ export default {
 
 /* ----- 工具函数 ----- */
 
-// 30 s–24 h 动态 TTL（+10 % 抖动）
+// 60 s–24 h 动态 TTL（+10 % 抖动）
 function calcTtl(r) {
   const retry = parseInt(r.headers.get('retry-after') || '0', 10);
   const reset = parseInt(r.headers.get('x-ratelimit-reset-requests') || '0', 10);
   let ttl = retry > 0 ? retry : reset || 60;
-  ttl = Math.min(Math.max(ttl, 30), 86_400);
+  ttl = Math.min(Math.max(ttl, 60), 86_400);
   ttl += Math.floor(ttl * 0.1 * Math.random());
   return ttl;
 }
