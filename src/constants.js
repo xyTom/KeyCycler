@@ -1,0 +1,15 @@
+export const SHARD_COUNT = 256;
+
+export const STATUS = {
+  UNKNOWN: "UNKNOWN",
+  ACTIVE: "ACTIVE",
+  INVALID: "INVALID",
+  QUOTA: "QUOTA",
+};
+
+export const EVENT_TYPE = {
+  PROMOTE_ACTIVE: "PROMOTE_ACTIVE",
+  MARK_INVALID: "MARK_INVALID",
+  MARK_QUOTA: "MARK_QUOTA",
+};
+

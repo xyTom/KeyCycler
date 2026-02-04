@@ -2,9 +2,28 @@ name = "openai-key-cycler"
 main = "src/worker.js"
 compatibility_date = "2025-07-05"
 
-[[kv_namespaces]]
-binding = "COOL"
-id      = "12f7af5ddd1944f1932c8533c42f339c"
+[[durable_objects.bindings]]
+name = "KEY_SHARD"
+class_name = "KeyShard"
+
+[[migrations]]
+tag = "v2"
+new_classes = ["KeyShard"]
+
+[[d1_databases]]
+binding = "KEY_DB"
+database_name = "keycycler"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+[[queues.producers]]
+binding = "KEY_EVENTS"
+queue = "key-events"
+
+[[queues.consumers]]
+queue = "key-events"
+max_batch_size = 50
+max_batch_timeout = 5
+max_retries = 3
 
 [observability.logs]
 enabled = true

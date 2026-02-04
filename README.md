@@ -1,78 +1,74 @@
-# KeyCycler
-这是一个基于 Cloudflare Workers 和 KV 存储的 API Key 轮换系统，能够自动管理多个 API Key，处理限流情况，并实现智能切换。
+# KeyCycler (Pro)
 
-## 功能特点
+基于 Cloudflare Workers + Durable Objects + D1 + Queues 的 OpenAI API Key 调度/轮换系统。
 
-- 🔄 **智能 Key 轮换**：随机起点扫描，均匀利用所有 Key
-- ❄️ **冷却机制**：遇到 429 限流时自动将 Key 放入冷却池
-- ⏰ **动态 TTL**：根据 OpenAI 返回的限制头精准设置冷却时间
-- 🌍 **全局一致性**：使用 Cloudflare KV 实现跨区域状态同步
-- ⚡ **高性能**：KV 读操作本地 PoP 纳秒级返回
-- 🛡️ **限制保护**：单次请求最多尝试 15 个 Key，避免触发子请求限制
+面向「Key 很多（可达 100 万）、单 Key RPM 很低（例如 3）、高并发」场景：通过 **DO 调度** 做主动限频与冷却，显著减少 429；D1 只存长期状态（UNKNOWN/ACTIVE/INVALID/QUOTA），避免频繁写库；Queues 仅处理状态迁移。 如果使用场景是「Key 不多（低于 1万）、单 Key RPM 很高（例如 100）、高并发」，则需要考虑使用普通版本，架构更加简洁高效，节省资源，代码在main分支上。
+
+## 核心特性
+
+- 256 分片（`key_id` 前 2 个 hex 字符）+ 每分片一个 DO，水平扩展
+- 双热池：`ring_active` 优先，`ring_unknown` 兜底，冷启动可用
+- 渐进验证：UNKNOWN 被用到且请求非鉴权失败时自动提升为 ACTIVE
+- 429 冷却持久化：`cool_map` 写入 DO storage，DO 重启不丢冷却
+- 写放大控制：成功请求不写 D1、不发 Queue；仅状态迁移写入
+
+## 架构概览
+
+- Worker `/v1/*`：代理到 Cloudflare AI Gateway（OpenAI provider）
+- DO `KeyShard`：发放 key（lease）+ 处理 429/失效/额度耗尽（report）+ alarm 补池
+- D1 `keys`：长期状态与管理查询
+- Queue `key-events`：只写入状态迁移（PROMOTE/INVALID/QUOTA）
 
 ## 部署步骤
 
-### 1. 克隆项目
-
-```bash
-git clone <your-repo-url>
-cd KeyCycler
-```
-
-### 2. 安装依赖
+### 1) 安装依赖
 
 ```bash
 npm install
 ```
 
-### 3. 配置 OpenAI Keys
-
-编辑 `openai_keys.txt` 文件，每行放一个 OpenAI API Key：
-
-```
-sk-your-openai-key-1
-sk-your-openai-key-2
-sk-your-openai-key-3
-```
-
-### 4. 创建 KV 命名空间
+### 2) 创建 D1 数据库
 
 ```bash
-# 创建生产环境 KV
-npm run kv:create
-
-# 创建预览环境 KV
-npm run kv:create-preview
+npx wrangler d1 create keycycler
 ```
 
-执行后会得到类似输出：
-```
-🌀 Creating namespace with title "openai-key-rotator-kv-COOL"
-✨ Success!
-Add the following to your configuration file in your kv_namespaces array:
-{ binding = "COOL", id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
-```
+把输出里的 `database_id` 填到 `wrangler.toml` 的 `[[d1_databases]]`。
 
-### 5. 更新 wrangler.toml
+### 3) 应用迁移
 
-将上一步得到的 KV ID 填入 `wrangler.toml`：
-
-```toml
-[[kv_namespaces]]
-binding = "COOL"
-id = "your-production-kv-id"
-preview_id = "your-preview-kv-id"
-```
-
-### 6. 本地开发
+远端（生产）：
 
 ```bash
-npm run dev
+npx wrangler d1 migrations apply keycycler --remote
 ```
 
-访问 `http://localhost:8787` 测试
+本地开发：
 
-### 7. 部署到生产
+```bash
+npx wrangler d1 migrations apply keycycler --local
+```
+
+### 4) 创建 Queue
+
+```bash
+npx wrangler queues create key-events
+```
+
+### 5) 配置 Secrets
+
+```bash
+npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put AI_GATEWAY_ACCOUNT_ID
+npx wrangler secret put AI_GATEWAY_NAME
+```
+
+说明：
+- `ADMIN_TOKEN`：管理接口鉴权
+- `AI_GATEWAY_ACCOUNT_ID`：Cloudflare AI Gateway account/project id
+- `AI_GATEWAY_NAME`：你在 AI Gateway 里创建的 gateway 名称（示例：`openai-worker`）
+
+### 6) 部署
 
 ```bash
 npm run deploy
@@ -80,84 +76,70 @@ npm run deploy
 
 ## 使用方法
 
-部署后，你的 Worker 会获得一个 URL（如 `https://your-worker.your-subdomain.workers.dev`）。
+### 1) 导入 Keys（分批）
 
-直接将这个 URL 作为 OpenAI API 的代理使用：
+一次最多建议 1 万行（服务端会截断），建议客户端循环调用导完 100 万。
 
 ```bash
-curl https://your-worker.your-subdomain.workers.dev/v1/chat/completions \
-  -H "Content-Type: application/json" \
+curl -X POST "https://<your-worker>/admin/keys/import" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" \\
+  -H "Content-Type: text/plain" \\
+  --data-binary @openai_keys.txt
+```
+
+### 2) 作为 OpenAI 代理使用
+
+```bash
+curl "https://<your-worker>/v1/chat/completions" \\
+  -H "Content-Type: application/json" \\
   -d '{
-    "model": "gpt-3.5-turbo",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "model": "gpt-4o-mini",
+    "messages": [{"role":"user","content":"hi"}]
   }'
 ```
 
-或在代码中使用：
-
-```javascript
-const response = await fetch('https://your-worker.your-subdomain.workers.dev/v1/chat/completions', {
-  method: 'POST',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  body: JSON.stringify({
-    model: 'gpt-3.5-turbo',
-    messages: [{ role: 'user', content: 'Hello!' }]
-  })
-});
-```
-
-## 工作原理
-
-1. **随机选择起点**：每次请求从随机位置开始扫描 Key 列表
-2. **检查冷却状态**：查询 KV 存储，跳过正在冷却的 Key
-3. **调用 OpenAI API**：使用可用的 Key 发起请求
-4. **处理限流**：收到 429 响应时，将 Key 写入 KV 并设置 TTL
-5. **智能重试**：最多尝试 15 个 Key，避免无限循环
-
-## 配置说明
-
-### TTL 计算策略
-
-- 优先使用 `Retry-After` 头
-- 其次使用 `x-ratelimit-reset-requests` 头
-- 默认 60 秒，最小 30 秒，最大 24 小时
-- 添加 10% 随机抖动防止雪崩
-
-### 子请求限制
-
-- 每个 Key 最多 2 个子请求（KV get + OpenAI fetch）
-- 单次请求最多扫描 15 个 Key
-- 总计不超过 45 个子请求，安全低于 50 限制
-
-## 监控和调试
-
-### 查看 KV 存储状态
+### 3) 查看统计
 
 ```bash
-wrangler kv:key list --binding COOL
+curl "https://<your-worker>/admin/stats" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
-### 查看特定 Key 的冷却状态
+### 4) 禁用/启用 Keys
+
+禁用（会同步通知 DO 立即移出热池）：
 
 ```bash
-wrangler kv:key get "sk-your-key" --binding COOL
+curl -X POST "https://<your-worker>/admin/keys/disable" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"key_ids":["<sha256hex>","<sha256hex>"]}'
 ```
 
-### 手动清除冷却状态
+启用：
 
 ```bash
-wrangler kv:key delete "sk-your-key" --binding COOL
+curl -X POST "https://<your-worker>/admin/keys/enable" \\
+  -H "Authorization: Bearer $ADMIN_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{"key_ids":["<sha256hex>"]}'
 ```
+
+## 可调参数（环境变量）
+
+以下都为可选（有默认值）：
+
+- `DEFAULT_RPM`（默认 3）
+- `EXPECTED_GLOBAL_RPS`（默认 2000）
+- `SAFETY`（默认 2.0）
+- `MIN_POOL_SIZE`（默认 300）
+- `REFILL_BATCH`（默认 200）
+- `INITIAL_FILL`（默认 200）
+- `INITIAL_FILL_TIMEOUT_MS`（默认 3000）
 
 ## 注意事项
 
-- ⚠️ 请妥善保管 `openai_keys.txt` 文件，不要提交到公共仓库
-- 🔄 KV 状态传播到全网可能需要 ~60 秒
-- 📊 建议至少配置 5-10 个 API Key 以获得最佳效果
-- 💰 注意 Cloudflare Workers 的计费规则和使用限制
+- 该项目不会在日志中打印明文 key（只可能出现 key_id 前缀）
+- D1 仅存长期状态，不存分钟级冷却；冷却由 DO storage 持久化
+- 如果你希望在高峰期进一步降低 429，通常优先调大 `EXPECTED_GLOBAL_RPS` / `SAFETY` 以提升 DO 热池目标
 
-## 许可证
-
-MIT License

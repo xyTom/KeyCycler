@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "kv:create": "wrangler kv namespace create KEY-CYCLER-COOL-DOWN-POOL",
-    "kv:create-preview": "wrangler kv namespace create KEY-CYCLER-COOL-DOWN-POOL --preview"
+    "d1:create": "wrangler d1 create keycycler",
+    "d1:migrate:remote": "wrangler d1 migrations apply keycycler --remote",
+    "d1:migrate:local": "wrangler d1 migrations apply keycycler --local",
+    "queues:create": "wrangler queues create key-events"
   },
   "keywords": [
     "cloudflare",
