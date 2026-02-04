@@ -86,6 +86,20 @@ curl -X POST "https://<your-worker>/admin/keys/import" \\
   -H "Content-Type: text/plain" \\
   --data-binary @openai_keys.txt
 ```
+分批导入脚本：
+
+```bash
+export WORKER="https://<your-worker>"
+export ADMIN_TOKEN="<your_admin_token>"
+
+split -l 10000 your_openai_keys.txt keys_part_
+for f in keys_part_*; do
+  curl -sS -X POST "$WORKER/admin/keys/import" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    -H "Content-Type: text/plain" \
+    --data-binary "@$f"
+done
+```
 
 ### 2) 作为 OpenAI 代理使用
 
@@ -142,4 +156,5 @@ curl -X POST "https://<your-worker>/admin/keys/enable" \\
 - 该项目不会在日志中打印明文 key（只可能出现 key_id 前缀）
 - D1 仅存长期状态，不存分钟级冷却；冷却由 DO storage 持久化
 - 如果你希望在高峰期进一步降低 429，通常优先调大 `EXPECTED_GLOBAL_RPS` / `SAFETY` 以提升 DO 热池目标
+
 
