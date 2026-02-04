@@ -9,20 +9,9 @@ function safeLogShard(shard) {
   return isValidHex2(shard) ? shard : "??";
 }
 
-function approxBytes(value) {
-  try {
-    const s = JSON.stringify(value);
-    return new TextEncoder().encode(s).length;
-  } catch {
-    return null;
-  }
-}
-
 export class KeyShard extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
-
-    this.loaded = false;
 
     this.shard = null; // 2 hex chars
     this.lower = null;
@@ -46,7 +35,6 @@ export class KeyShard extends DurableObject {
     this.cursorIdxUnknown = 0;
 
     this.refillInFlight = null;
-    this.lastStorageSizeLogAt = 0;
 
     this.cfg = this._loadConfig(env);
 
@@ -81,7 +69,6 @@ export class KeyShard extends DurableObject {
     this.cursorIdxActive = 0;
     this.cursorIdxUnknown = 0;
     this.refillInFlight = null;
-    this.loaded = true;
   }
 
   _loadConfig(env) {
@@ -93,16 +80,23 @@ export class KeyShard extends DurableObject {
     const expectedShardRps = expectedGlobalRps / SHARD_COUNT;
     const target = Math.ceil(expectedShardRps * (minIntervalMs / 1000) * safety);
 
+    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "700", 10) || 700;
+    const minPoolSizeRaw = parseInt(env.MIN_POOL_SIZE || "200", 10) || 200;
+    const refillBatchRaw = parseInt(env.REFILL_BATCH || "200", 10) || 200;
+    const initialFillRaw = parseInt(env.INITIAL_FILL || "200", 10) || 200;
+
     return {
       defaultRpm,
       minIntervalMs,
       maxScan: 200,
 
       // Pool sizing: computed target, then clamped.
-      targetHotPoolSize: clamp(target, 300, 3000),
-      minPoolSize: parseInt(env.MIN_POOL_SIZE || "300", 10) || 300,
-      refillBatch: parseInt(env.REFILL_BATCH || "200", 10) || 200,
-      initialFill: parseInt(env.INITIAL_FILL || "200", 10) || 200,
+      // DO storage limit: 128KB per value. Each entry ~130 bytes, max ~900 keys per ring.
+      maxPoolSize,
+      targetHotPoolSize: clamp(target, 200, maxPoolSize),
+      minPoolSize: clamp(minPoolSizeRaw, 1, maxPoolSize),
+      refillBatch: clamp(refillBatchRaw, 1, maxPoolSize),
+      initialFill: clamp(initialFillRaw, 1, maxPoolSize),
       initialFillTimeoutMs: parseInt(env.INITIAL_FILL_TIMEOUT_MS || "3000", 10) || 3000,
 
       streakDecayMs: 5 * 60_000,
@@ -110,10 +104,6 @@ export class KeyShard extends DurableObject {
       activeMaxStreak: 3,
       unknownCapMs: 30 * 60_000,
       activeCapMs: 10 * 60_000,
-
-      // Storage monitoring (approximate)
-      storageLogEveryMs: 60_000,
-      storageWarnBytes: 1_500_000,
     };
   }
 
@@ -133,6 +123,7 @@ export class KeyShard extends DurableObject {
 
     const ringActive = await this._safeGet("ring_active", []);
     const ringUnknown = await this._safeGet("ring_unknown", []);
+
     this.ringActive = Array.isArray(ringActive)
       ? ringActive.filter((e) => e && typeof e.key_id === "string" && typeof e.key_plain === "string")
       : [];
@@ -156,8 +147,6 @@ export class KeyShard extends DurableObject {
     // Clamp indices to current ring sizes.
     if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
     if (this.ringUnknown.length > 0) this.cursorIdxUnknown %= this.ringUnknown.length;
-
-    this.loaded = true;
   }
 
   _rebuildSets() {
@@ -195,28 +184,6 @@ export class KeyShard extends DurableObject {
     const jitter = Math.floor(Math.random() * 30_000);
     const target = Date.now() + 1_000 + jitter;
     if (current == null || target < current) await this.ctx.storage.setAlarm(target);
-  }
-
-  _maybeLogStorageSizes(reason) {
-    const now = Date.now();
-    if (now - this.lastStorageSizeLogAt < this.cfg.storageLogEveryMs) return;
-    this.lastStorageSizeLogAt = now;
-
-    const sizeActive = approxBytes(this.ringActive);
-    const sizeUnknown = approxBytes(this.ringUnknown);
-    const sizeCool = approxBytes(this.coolPersist);
-
-    const warn = [];
-    if (sizeActive != null && sizeActive >= this.cfg.storageWarnBytes) warn.push(`ring_active=${sizeActive}`);
-    if (sizeUnknown != null && sizeUnknown >= this.cfg.storageWarnBytes) warn.push(`ring_unknown=${sizeUnknown}`);
-    if (sizeCool != null && sizeCool >= this.cfg.storageWarnBytes) warn.push(`cool_map=${sizeCool}`);
-
-    if (warn.length > 0) {
-      console.warn(
-        `[shard-${safeLogShard(this.shard)}] storage size high (${reason}): ${warn.join(", ")} bytes; ` +
-          `counts: active=${this.ringActive.length} unknown=${this.ringUnknown.length} cool=${Object.keys(this.coolPersist).length}`,
-      );
-    }
   }
 
   _coolUntilMs(keyId, nowMs) {
@@ -352,8 +319,6 @@ export class KeyShard extends DurableObject {
     if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
     if (this.ringUnknown.length > 0) this.cursorIdxUnknown %= this.ringUnknown.length;
 
-    this._maybeLogStorageSizes("persist_rings");
-
     try {
       await this.ctx.storage.put({
         ring_active: this.ringActive,
@@ -371,8 +336,6 @@ export class KeyShard extends DurableObject {
   async _persistCoolMapIfDirty() {
     if (!this.coolDirty) return;
     this.coolDirty = false;
-
-    this._maybeLogStorageSizes("persist_cool");
 
     try {
       await this.ctx.storage.put("cool_map", this.coolPersist);

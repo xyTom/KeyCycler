@@ -42,7 +42,18 @@ export async function callUpstream(origReq, env, apiKey, requestBody) {
     cf: { cacheEverything: false },
   };
 
-  init.headers.set("authorization", `Bearer ${apiKey}`);
+  // Validate and sanitize API key before setting header to avoid "Invalid header value" errors.
+  // (e.g. accidental trailing newline / control characters when imported from files)
+  const safeKey = String(apiKey ?? "")
+    .trim()
+    .replace(/[\u0000-\u001F\u007F]/g, "");
+  if (!safeKey || safeKey.length < 10) {
+    return json(
+      { error: { message: "Invalid API key in pool", type: "configuration_error" } },
+      { status: 500 },
+    );
+  }
+  init.headers.set("authorization", `Bearer ${safeKey}`);
 
   // Strip Cloudflare and hop-by-hop-ish headers.
   init.headers.delete("host");
