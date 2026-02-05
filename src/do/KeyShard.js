@@ -82,7 +82,7 @@ export class KeyShard extends DurableObject {
 
     // Durable Object KV storage has a 128KB per-value limit. Because we persist `key_plain`,
     // the safe pool size depends on your key length.
-    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "700", 10) || 600;
+    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "600", 10) || 600;
     const minPoolSizeRaw = parseInt(env.MIN_POOL_SIZE || "200", 10) || 200;
     const refillBatchRaw = parseInt(env.REFILL_BATCH || "200", 10) || 200;
     const initialFillRaw = parseInt(env.INITIAL_FILL || "200", 10) || 200;
