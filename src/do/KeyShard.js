@@ -80,7 +80,9 @@ export class KeyShard extends DurableObject {
     const expectedShardRps = expectedGlobalRps / SHARD_COUNT;
     const target = Math.ceil(expectedShardRps * (minIntervalMs / 1000) * safety);
 
-    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "700", 10) || 700;
+    // Durable Object KV storage has a 128KB per-value limit. Because we persist `key_plain`,
+    // the safe pool size depends on your key length.
+    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "700", 10) || 600;
     const minPoolSizeRaw = parseInt(env.MIN_POOL_SIZE || "200", 10) || 200;
     const refillBatchRaw = parseInt(env.REFILL_BATCH || "200", 10) || 200;
     const initialFillRaw = parseInt(env.INITIAL_FILL || "200", 10) || 200;
@@ -91,7 +93,7 @@ export class KeyShard extends DurableObject {
       maxScan: 200,
 
       // Pool sizing: computed target, then clamped.
-      // DO storage limit: 128KB per value. Each entry ~130 bytes, max ~900 keys per ring.
+      // DO KV storage has a 128KB per-value limit; since we persist `key_plain`, safe pool size depends on key length.
       maxPoolSize,
       targetHotPoolSize: clamp(target, 200, maxPoolSize),
       minPoolSize: clamp(minPoolSizeRaw, 1, maxPoolSize),
@@ -107,22 +109,51 @@ export class KeyShard extends DurableObject {
     };
   }
 
-  async _safeGet(key, fallback) {
-    try {
-      const v = await this.ctx.storage.get(key);
-      return v == null ? fallback : v;
-    } catch (e) {
-      console.error(`[shard-${safeLogShard(this.shard)}] storage.get(${key}) failed:`, e?.message || e);
-      return fallback;
+  _enforcePoolLimits() {
+    const maxTotal = this.cfg.maxPoolSize;
+    const total = this.ringActive.length + this.ringUnknown.length;
+    if (total <= maxTotal) return;
+
+    let extra = total - maxTotal;
+    // Prefer trimming UNKNOWN first.
+    if (extra > 0 && this.ringUnknown.length > 0) {
+      const drop = Math.min(extra, this.ringUnknown.length);
+      this.ringUnknown.splice(-drop, drop);
+      extra -= drop;
     }
+    if (extra > 0 && this.ringActive.length > 0) {
+      const drop = Math.min(extra, this.ringActive.length);
+      this.ringActive.splice(-drop, drop);
+    }
+    this._rebuildSets();
   }
 
   async _loadFromStorage() {
-    const shard = await this._safeGet("shard", null);
+    // Batch read all keys in one operation to reduce storage ops (8 ops -> 1 op).
+    const keys = [
+      "shard",
+      "ring_active",
+      "ring_unknown",
+      "cursor_active_keyid",
+      "cursor_unknown_keyid",
+      "cursor_idx_active",
+      "cursor_idx_unknown",
+      "cool_map",
+    ];
+
+    let data;
+    try {
+      data = await this.ctx.storage.get(keys);
+    } catch (e) {
+      console.error(`[shard-${safeLogShard(this.shard)}] batch storage.get failed:`, e?.message || e);
+      return;
+    }
+
+    const shard = data.get("shard");
     if (isValidHex2(shard)) this._setShard(shard);
 
-    const ringActive = await this._safeGet("ring_active", []);
-    const ringUnknown = await this._safeGet("ring_unknown", []);
+    const ringActive = data.get("ring_active") || [];
+    const ringUnknown = data.get("ring_unknown") || [];
 
     this.ringActive = Array.isArray(ringActive)
       ? ringActive.filter((e) => e && typeof e.key_id === "string" && typeof e.key_plain === "string")
@@ -131,18 +162,20 @@ export class KeyShard extends DurableObject {
       ? ringUnknown.filter((e) => e && typeof e.key_id === "string" && typeof e.key_plain === "string")
       : [];
 
-    this.cursorActiveKeyid = (await this._safeGet("cursor_active_keyid", null)) || null;
-    this.cursorUnknownKeyid = (await this._safeGet("cursor_unknown_keyid", null)) || null;
+    this.cursorActiveKeyid = data.get("cursor_active_keyid") || null;
+    this.cursorUnknownKeyid = data.get("cursor_unknown_keyid") || null;
 
-    const idxA = await this._safeGet("cursor_idx_active", 0);
-    const idxU = await this._safeGet("cursor_idx_unknown", 0);
+    const idxA = data.get("cursor_idx_active");
+    const idxU = data.get("cursor_idx_unknown");
     this.cursorIdxActive = Number.isFinite(idxA) ? idxA : 0;
     this.cursorIdxUnknown = Number.isFinite(idxU) ? idxU : 0;
 
-    const cool = await this._safeGet("cool_map", {});
+    const cool = data.get("cool_map");
     this.coolPersist = cool && typeof cool === "object" && !Array.isArray(cool) ? cool : {};
 
     this._rebuildSets();
+
+    this._enforcePoolLimits();
 
     // Clamp indices to current ring sizes.
     if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
@@ -175,8 +208,9 @@ export class KeyShard extends DurableObject {
   async _ensureAlarmScheduled() {
     const current = await this.ctx.storage.getAlarm();
     if (current != null) return;
-    const jitter = Math.floor(Math.random() * 30_000);
-    await this.ctx.storage.setAlarm(Date.now() + 60_000 + jitter);
+    // 5 minutes base + jitter to reduce storage ops.
+    const jitter = Math.floor(Math.random() * 60_000);
+    await this.ctx.storage.setAlarm(Date.now() + 300_000 + jitter);
   }
 
   async _scheduleAlarmSoon() {
@@ -315,6 +349,8 @@ export class KeyShard extends DurableObject {
   }
 
   async _persistRingsAndCursors() {
+    this._enforcePoolLimits();
+
     // Clamp indices to current ring sizes.
     if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
     if (this.ringUnknown.length > 0) this.cursorIdxUnknown %= this.ringUnknown.length;
@@ -374,10 +410,10 @@ export class KeyShard extends DurableObject {
       }
     }
 
-    // Reschedule next alarm.
-    const jitter = Math.floor(Math.random() * 30_000);
+    // Reschedule next alarm (5 minutes base + jitter).
+    const jitter = Math.floor(Math.random() * 60_000);
     try {
-      await this.ctx.storage.setAlarm(Date.now() + 60_000 + jitter);
+      await this.ctx.storage.setAlarm(Date.now() + 300_000 + jitter);
     } catch (e) {
       console.error(`[shard-${safeLogShard(this.shard)}] setAlarm failed:`, e?.message || e);
     }
@@ -463,7 +499,6 @@ export class KeyShard extends DurableObject {
         const removed = this._removeKeyEverywhere(keyId);
         if (removed.changed) {
           await this._persistRingsAndCursors();
-          this.coolDirty = true;
           await this._persistCoolMapIfDirty();
         }
 
@@ -532,7 +567,6 @@ export class KeyShard extends DurableObject {
       }
       if (changed) {
         await this._persistRingsAndCursors();
-        this.coolDirty = true;
         await this._persistCoolMapIfDirty();
       }
       return json({ ok: true, removed });
