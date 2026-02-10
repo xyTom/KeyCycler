@@ -112,7 +112,7 @@ export class KeyShardV2 extends DurableObject {
 
       const versionRow = this.ctx.storage.sql
         .exec("SELECT value FROM meta WHERE key = 'schema_version'")
-        .one();
+        .toArray()[0];
       const parsed = Number.parseInt(versionRow?.value ?? "0", 10);
       const version = Number.isFinite(parsed) ? parsed : 0;
 
@@ -216,7 +216,7 @@ export class KeyShardV2 extends DurableObject {
   // Meta Helpers
   // ============================================================================
   _getMeta(key) {
-    const row = this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key).one();
+    const row = this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0];
     return row?.value ?? null;
   }
 
