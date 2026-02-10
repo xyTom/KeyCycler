@@ -9,13 +9,13 @@
 - 256 分片（`key_id` 前 2 个 hex 字符）+ 每分片一个 DO，水平扩展
 - 双热池：`ring_active` 优先，`ring_unknown` 兜底，冷启动可用
 - 渐进验证：UNKNOWN 被用到且请求非鉴权失败时自动提升为 ACTIVE
-- 429 冷却持久化：`cool_map` 写入 DO storage，DO 重启不丢冷却
+- 429 冷却持久化：写入 SQLite-backed DO 存储，DO 重启不丢冷却
 - 写放大控制：成功请求不写 D1、不发 Queue；仅状态迁移写入
 
 ## 架构概览
 
 - Worker `/v1/*`：代理到 Cloudflare AI Gateway（OpenAI provider）
-- DO `KeyShard`：发放 key（lease）+ 处理 429/失效/额度耗尽（report）+ alarm 补池
+- DO `KeyShardV2`：发放 key（lease）+ 处理 429/失效/额度耗尽（report）+ alarm 补池
 - D1 `keys`：长期状态与管理查询
 - Queue `key-events`：只写入状态迁移（PROMOTE/INVALID/QUOTA）
 
@@ -154,7 +154,7 @@ curl -X POST "https://<your-worker>/admin/keys/enable" \\
 ## 注意事项
 
 - 该项目不会在日志中打印明文 key（只可能出现 key_id 前缀）
-- D1 仅存长期状态，不存分钟级冷却；冷却由 DO storage 持久化
+- D1 仅存长期状态，不存分钟级冷却；冷却由 SQLite-backed DO 持久化
+- 当前版本使用 `KeyShardV2`（SQLite-backed DO），不兼容旧 `KeyShard` 的历史内存/存储状态
 - 如果你希望在高峰期进一步降低 429，通常优先调大 `EXPECTED_GLOBAL_RPS` / `SAFETY` 以提升 DO 热池目标
-
 

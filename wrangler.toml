@@ -4,16 +4,20 @@ compatibility_date = "2025-07-05"
 
 [[durable_objects.bindings]]
 name = "KEY_SHARD"
-class_name = "KeyShard"
+class_name = "KeyShardV2"
 
 [[migrations]]
-tag = "v2"
+tag = "v3"
 new_classes = ["KeyShard"]
+
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["KeyShardV2"]
 
 [[d1_databases]]
 binding = "KEY_DB"
 database_name = "keycycler"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "ef974098-0b1a-4ead-bc1f-d892f1663236"
 
 [[queues.producers]]
 binding = "KEY_EVENTS"

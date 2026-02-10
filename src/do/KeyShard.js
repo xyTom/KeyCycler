@@ -5,46 +5,56 @@ import { badRequest, json } from "../lib/http.js";
 import { isValidHex2, shardUpperBound } from "../lib/shard.js";
 import { clamp } from "../lib/rate_limit.js";
 
+// ============================================================================
+// Configuration Constants
+// ============================================================================
+const CURSOR_FLUSH_EVERY = 64; // Checkpoint cursor every N leases
+const CURSOR_FLUSH_INTERVAL_MS = 1000; // Or flush if >1s since last flush
+const COOL_BATCH_DELETE_SIZE = 64; // Batch delete expired cooldowns
+const MAX_POOL_SIZE = 2000; // Memory ring hard limit (SQL can store more)
+
 function safeLogShard(shard) {
   return isValidHex2(shard) ? shard : "??";
 }
 
-export class KeyShard extends DurableObject {
+export class KeyShardV2 extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
 
-    this.shard = null; // 2 hex chars
-    this.lower = null;
-    this.upper = null;
-
-    this.ringActive = [];
+    // Memory state
+    this.ringActive = []; // { seq, key_id, key_plain }[]
     this.ringUnknown = [];
     this.activeSet = new Set();
     this.unknownSet = new Set();
 
-    // Persisted cooldowns only (429).
+    // Persisted cooldowns (429)
     this.coolPersist = {}; // key_id -> { until_ms, streak, last_429_at }
-    this.coolDirty = false;
-
-    // Ephemeral min-interval + transient ERROR cooldowns only (not persisted).
+    // Ephemeral min-interval cooldowns (not persisted)
     this.coolEphemeral = new Map(); // key_id -> until_ms
+    // Pending expired cooldowns for batch deletion
+    this.coolExpiredPending = [];
 
-    this.cursorActiveKeyid = null;
-    this.cursorUnknownKeyid = null;
-    this.cursorIdxActive = 0;
-    this.cursorIdxUnknown = 0;
+    // Cursor state (seq-based)
+    this.cursorActiveSeq = 0;
+    this.cursorUnknownSeq = 0;
+    this.cursorDirtyCount = 0;
+    this.cursorLastFlush = 0;
+
+    this.shard = null;
+    this.lower = null;
+    this.upper = null;
 
     this.refillInFlight = null;
 
     this.cfg = this._loadConfig(env);
 
-    // If storage contains unexpected/corrupted values, we should still serve and self-heal
-    // rather than permanently blocking this DO instance.
+    // Initialize synchronously within blockConcurrencyWhile
     this.ctx.blockConcurrencyWhile(async () => {
       try {
-        await this._loadFromStorage();
+        this._ensureSchema();
+        this._loadFromSQL();
       } catch (e) {
-        console.error(`[shard-${safeLogShard(this.shard)}] init load failed:`, e?.message || e);
+        console.error(`[shard-${safeLogShard(this.shard)}] init failed:`, e?.message || e);
         this._resetInMemoryState();
       }
 
@@ -62,12 +72,12 @@ export class KeyShard extends DurableObject {
     this.activeSet = new Set();
     this.unknownSet = new Set();
     this.coolPersist = {};
-    this.coolDirty = false;
     this.coolEphemeral = new Map();
-    this.cursorActiveKeyid = null;
-    this.cursorUnknownKeyid = null;
-    this.cursorIdxActive = 0;
-    this.cursorIdxUnknown = 0;
+    this.coolExpiredPending = [];
+    this.cursorActiveSeq = 0;
+    this.cursorUnknownSeq = 0;
+    this.cursorDirtyCount = 0;
+    this.cursorLastFlush = 0;
     this.refillInFlight = null;
   }
 
@@ -80,9 +90,9 @@ export class KeyShard extends DurableObject {
     const expectedShardRps = expectedGlobalRps / SHARD_COUNT;
     const target = Math.ceil(expectedShardRps * (minIntervalMs / 1000) * safety);
 
-    // Durable Object KV storage has a 128KB per-value limit. Because we persist `key_plain`,
-    // the safe pool size depends on your key length. For ~200 byte keys, max is ~500.
-    const maxPoolSize = parseInt(env.MAX_POOL_SIZE || "450", 10) || 450;
+    // With SQLite we can store more keys, but memory is still limited
+    const maxPoolSizeRaw = parseInt(env.MAX_POOL_SIZE || "2000", 10) || 2000;
+    const effectiveMaxPoolSize = Math.min(maxPoolSizeRaw, MAX_POOL_SIZE);
     const minPoolSizeRaw = parseInt(env.MIN_POOL_SIZE || "200", 10) || 200;
     const refillBatchRaw = parseInt(env.REFILL_BATCH || "200", 10) || 200;
     const initialFillRaw = parseInt(env.INITIAL_FILL || "200", 10) || 200;
@@ -92,13 +102,11 @@ export class KeyShard extends DurableObject {
       minIntervalMs,
       maxScan: 200,
 
-      // Pool sizing: computed target, then clamped.
-      // DO KV storage has a 128KB per-value limit; since we persist `key_plain`, safe pool size depends on key length.
-      maxPoolSize,
-      targetHotPoolSize: clamp(target, 200, maxPoolSize),
-      minPoolSize: clamp(minPoolSizeRaw, 1, maxPoolSize),
-      refillBatch: clamp(refillBatchRaw, 1, maxPoolSize),
-      initialFill: clamp(initialFillRaw, 1, maxPoolSize),
+      maxPoolSize: effectiveMaxPoolSize,
+      targetHotPoolSize: clamp(target, 200, effectiveMaxPoolSize),
+      minPoolSize: clamp(minPoolSizeRaw, 1, effectiveMaxPoolSize),
+      refillBatch: clamp(refillBatchRaw, 1, effectiveMaxPoolSize),
+      initialFill: clamp(initialFillRaw, 1, effectiveMaxPoolSize),
       initialFillTimeoutMs: parseInt(env.INITIAL_FILL_TIMEOUT_MS || "3000", 10) || 3000,
 
       streakDecayMs: 5 * 60_000,
@@ -109,82 +117,139 @@ export class KeyShard extends DurableObject {
     };
   }
 
-  _enforcePoolLimits() {
-    const maxTotal = this.cfg.maxPoolSize;
-    const total = this.ringActive.length + this.ringUnknown.length;
-    if (total <= maxTotal) return;
+  // ============================================================================
+  // Schema Management (PRAGMA user_version)
+  // ============================================================================
+  _ensureSchema() {
+    const row = this.ctx.storage.sql.exec("PRAGMA user_version").one();
+    const version = row?.user_version || 0;
 
-    let extra = total - maxTotal;
-    // Prefer trimming UNKNOWN first.
-    if (extra > 0 && this.ringUnknown.length > 0) {
-      const drop = Math.min(extra, this.ringUnknown.length);
-      this.ringUnknown.splice(-drop, drop);
-      extra -= drop;
+    if (version < 1) {
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec(`
+          CREATE TABLE IF NOT EXISTS ring (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id TEXT UNIQUE NOT NULL,
+            key_plain TEXT NOT NULL,
+            pool TEXT NOT NULL CHECK(pool IN ('active', 'unknown'))
+          )
+        `);
+        this.ctx.storage.sql.exec(`
+          CREATE TABLE IF NOT EXISTS cooldown (
+            key_id TEXT PRIMARY KEY,
+            until_ms INTEGER NOT NULL,
+            streak INTEGER NOT NULL DEFAULT 0,
+            last_429_at INTEGER NOT NULL
+          )
+        `);
+        this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_cooldown_until ON cooldown(until_ms)");
+        this.ctx.storage.sql.exec(`
+          CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+          )
+        `);
+        this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_ring_pool_seq ON ring(pool, seq)");
+        this.ctx.storage.sql.exec("PRAGMA user_version = 1");
+      });
     }
-    if (extra > 0 && this.ringActive.length > 0) {
-      const drop = Math.min(extra, this.ringActive.length);
-      this.ringActive.splice(-drop, drop);
-    }
-    this._rebuildSets();
+
+    // Future migrations: if (version < 2) { ... PRAGMA user_version = 2; }
   }
 
-  async _loadFromStorage() {
-    // Batch read all keys in one operation to reduce storage ops (8 ops -> 1 op).
-    const keys = [
-      "shard",
-      "ring_active",
-      "ring_unknown",
-      "cursor_active_keyid",
-      "cursor_unknown_keyid",
-      "cursor_idx_active",
-      "cursor_idx_unknown",
-      "cool_map",
-    ];
+  // ============================================================================
+  // SQL Loading
+  // ============================================================================
+  _loadFromSQL() {
+    const now = Date.now();
 
-    let data;
-    try {
-      data = await this.ctx.storage.get(keys);
-    } catch (e) {
-      console.error(`[shard-${safeLogShard(this.shard)}] batch storage.get failed:`, e?.message || e);
-      return;
+    // Load rings with MAX_POOL_SIZE limit
+    this.ringActive = this.ctx.storage.sql
+      .exec("SELECT seq, key_id, key_plain FROM ring WHERE pool='active' ORDER BY seq LIMIT ?", this.cfg.maxPoolSize)
+      .toArray();
+    this.ringUnknown = this.ctx.storage.sql
+      .exec("SELECT seq, key_id, key_plain FROM ring WHERE pool='unknown' ORDER BY seq LIMIT ?", this.cfg.maxPoolSize)
+      .toArray();
+
+    // Load unexpired cooldowns
+    const coolRows = this.ctx.storage.sql
+      .exec("SELECT key_id, until_ms, streak, last_429_at FROM cooldown WHERE until_ms > ?", now)
+      .toArray();
+    this.coolPersist = {};
+    for (const row of coolRows) {
+      this.coolPersist[row.key_id] = {
+        until_ms: row.until_ms,
+        streak: row.streak,
+        last_429_at: row.last_429_at,
+      };
     }
 
-    const shard = data.get("shard");
+    // Load cursors
+    this.cursorActiveSeq = this._getMetaInt("cursor_active_seq") ?? 0;
+    this.cursorUnknownSeq = this._getMetaInt("cursor_unknown_seq") ?? 0;
+
+    // Load shard
+    const shard = this._getMeta("shard");
     if (isValidHex2(shard)) this._setShard(shard);
 
-    const ringActive = data.get("ring_active") || [];
-    const ringUnknown = data.get("ring_unknown") || [];
-
-    this.ringActive = Array.isArray(ringActive)
-      ? ringActive.filter((e) => e && typeof e.key_id === "string" && typeof e.key_plain === "string")
-      : [];
-    this.ringUnknown = Array.isArray(ringUnknown)
-      ? ringUnknown.filter((e) => e && typeof e.key_id === "string" && typeof e.key_plain === "string")
-      : [];
-
-    this.cursorActiveKeyid = data.get("cursor_active_keyid") || null;
-    this.cursorUnknownKeyid = data.get("cursor_unknown_keyid") || null;
-
-    const idxA = data.get("cursor_idx_active");
-    const idxU = data.get("cursor_idx_unknown");
-    this.cursorIdxActive = Number.isFinite(idxA) ? idxA : 0;
-    this.cursorIdxUnknown = Number.isFinite(idxU) ? idxU : 0;
-
-    const cool = data.get("cool_map");
-    this.coolPersist = cool && typeof cool === "object" && !Array.isArray(cool) ? cool : {};
-
     this._rebuildSets();
+    this._validateCursors();
 
-    this._enforcePoolLimits();
-
-    // Clamp indices to current ring sizes.
-    if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
-    if (this.ringUnknown.length > 0) this.cursorIdxUnknown %= this.ringUnknown.length;
+    // Reset flush tracking
+    this.cursorDirtyCount = 0;
+    this.cursorLastFlush = now;
   }
 
+  // ============================================================================
+  // Cursor Validation
+  // ============================================================================
+  _validateCursors() {
+    // If cursorActiveSeq doesn't exist in ring, reset to min seq - 1
+    if (this.ringActive.length > 0) {
+      const seqs = this.ringActive.map((r) => r.seq);
+      if (!seqs.includes(this.cursorActiveSeq)) {
+        this.cursorActiveSeq = Math.min(...seqs) - 1;
+      }
+    } else {
+      this.cursorActiveSeq = 0;
+    }
+
+    // Same for unknown ring
+    if (this.ringUnknown.length > 0) {
+      const seqs = this.ringUnknown.map((r) => r.seq);
+      if (!seqs.includes(this.cursorUnknownSeq)) {
+        this.cursorUnknownSeq = Math.min(...seqs) - 1;
+      }
+    } else {
+      this.cursorUnknownSeq = 0;
+    }
+  }
+
+  // ============================================================================
+  // Meta Helpers
+  // ============================================================================
+  _getMeta(key) {
+    const row = this.ctx.storage.sql.exec("SELECT value FROM meta WHERE key = ?", key).one();
+    return row?.value ?? null;
+  }
+
+  _getMetaInt(key) {
+    const v = this._getMeta(key);
+    if (v == null) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  _setMeta(key, value) {
+    this.ctx.storage.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", key, String(value));
+  }
+
+  // ============================================================================
+  // Set Helpers
+  // ============================================================================
   _rebuildSets() {
-    this.activeSet = new Set(this.ringActive.map((k) => k?.key_id).filter(Boolean));
-    this.unknownSet = new Set(this.ringUnknown.map((k) => k?.key_id).filter(Boolean));
+    this.activeSet = new Set(this.ringActive.map((r) => r.key_id));
+    this.unknownSet = new Set(this.ringUnknown.map((r) => r.key_id));
   }
 
   _setShard(shard) {
@@ -193,76 +258,153 @@ export class KeyShard extends DurableObject {
     this.upper = shardUpperBound(shard);
   }
 
-  async _ensureShardFromRequest(req) {
-    const shard = (req.headers.get("x-shard") || "").toLowerCase();
-    if (!isValidHex2(shard)) throw new Error("missing_or_invalid_x-shard");
+  // ============================================================================
+  // Cursor Checkpoint
+  // ============================================================================
+  _maybePersistCursor(nowMs) {
+    this.cursorDirtyCount++;
 
-    if (this.shard && this.shard !== shard) throw new Error("shard_mismatch");
-    if (!this.shard) {
-      this._setShard(shard);
-      await this.ctx.storage.put("shard", shard);
+    if (
+      this.cursorDirtyCount >= CURSOR_FLUSH_EVERY ||
+      nowMs - this.cursorLastFlush >= CURSOR_FLUSH_INTERVAL_MS
+    ) {
+      this._flushCursors();
+      this.cursorDirtyCount = 0;
+      this.cursorLastFlush = nowMs;
     }
-    return shard;
   }
 
-  async _ensureAlarmScheduled() {
-    const current = await this.ctx.storage.getAlarm();
-    if (current != null) return;
-    // 5 minutes base + jitter to reduce storage ops.
-    const jitter = Math.floor(Math.random() * 60_000);
-    await this.ctx.storage.setAlarm(Date.now() + 300_000 + jitter);
+  _flushCursors() {
+    this.ctx.storage.transactionSync(() => {
+      this._setMeta("cursor_active_seq", this.cursorActiveSeq);
+      this._setMeta("cursor_unknown_seq", this.cursorUnknownSeq);
+    });
   }
 
-  async _scheduleAlarmSoon() {
-    const current = await this.ctx.storage.getAlarm();
-    const jitter = Math.floor(Math.random() * 30_000);
-    const target = Date.now() + 1_000 + jitter;
-    if (current == null || target < current) await this.ctx.storage.setAlarm(target);
+  // ============================================================================
+  // Cooldown Helpers
+  // ============================================================================
+  _setEphemeralCooldown(keyId, untilMs) {
+    const prev = this.coolEphemeral.get(keyId) || 0;
+    if (untilMs > prev) this.coolEphemeral.set(keyId, untilMs);
   }
 
-  _coolUntilMs(keyId, nowMs) {
-    const persisted = this.coolPersist[keyId]?.until_ms || 0;
-    const eph = this.coolEphemeral.get(keyId) || 0;
-    const until = Math.max(persisted, eph);
-    if (until <= nowMs) {
-      if (eph && eph <= nowMs) this.coolEphemeral.delete(keyId);
-      if (persisted && persisted <= nowMs) {
-        delete this.coolPersist[keyId];
-        this.coolDirty = true;
+  _isCooling(keyId, nowMs) {
+    // Check ephemeral (min-interval) first
+    const eph = this.coolEphemeral.get(keyId);
+    if (eph && eph > nowMs) return true;
+    if (eph && eph <= nowMs) this.coolEphemeral.delete(keyId);
+
+    // Check persisted (429)
+    const persisted = this.coolPersist[keyId];
+    if (!persisted) return false;
+
+    if (persisted.until_ms > nowMs) return true;
+
+    // Expired - add to pending batch delete
+    delete this.coolPersist[keyId];
+    this.coolExpiredPending.push(keyId);
+
+    // Batch delete when threshold reached
+    if (this.coolExpiredPending.length >= COOL_BATCH_DELETE_SIZE) {
+      this._flushExpiredCooldowns();
+    }
+
+    return false;
+  }
+
+  _flushExpiredCooldowns() {
+    if (this.coolExpiredPending.length === 0) return;
+
+    const ids = this.coolExpiredPending.splice(0);
+    this.ctx.storage.transactionSync(() => {
+      for (const keyId of ids) {
+        this.ctx.storage.sql.exec("DELETE FROM cooldown WHERE key_id = ?", keyId);
       }
-      return 0;
-    }
-    return until;
+    });
   }
 
+  // ============================================================================
+  // Lease Logic (Memory + Cursor Checkpoint)
+  // ============================================================================
   _pickFromRing(ring, pool, nowMs) {
     if (ring.length === 0) return null;
 
-    let idxRef = pool === "active" ? this.cursorIdxActive : this.cursorIdxUnknown;
-    const maxScan = Math.min(this.cfg.maxScan, ring.length);
+    const cursorSeq = pool === "active" ? this.cursorActiveSeq : this.cursorUnknownSeq;
 
-    for (let i = 0; i < maxScan; i++) {
-      const idx = (idxRef + i) % ring.length;
-      const entry = ring[idx];
-      const until = this._coolUntilMs(entry.key_id, nowMs);
-      if (until > nowMs) continue;
+    // Find from after cursor
+    for (const entry of ring) {
+      if (entry.seq <= cursorSeq) continue;
+      if (this._isCooling(entry.key_id, nowMs)) continue;
 
-      // Advance cursor for next request.
-      const nextIdx = (idx + 1) % ring.length;
-      if (pool === "active") this.cursorIdxActive = nextIdx;
-      else this.cursorIdxUnknown = nextIdx;
+      // Found - update memory cursor
+      if (pool === "active") this.cursorActiveSeq = entry.seq;
+      else this.cursorUnknownSeq = entry.seq;
 
-      // Min-interval guard (ephemeral only).
-      const minUntil = nowMs + this.cfg.minIntervalMs;
-      const prev = this.coolEphemeral.get(entry.key_id) || 0;
-      if (minUntil > prev) this.coolEphemeral.set(entry.key_id, minUntil);
+      // Checkpoint cursor (not every time)
+      this._maybePersistCursor(nowMs);
+
+      // Set min-interval cooldown (memory only)
+      this._setEphemeralCooldown(entry.key_id, nowMs + this.cfg.minIntervalMs);
 
       return entry;
     }
 
-    return null;
+    // Wrap around: search from beginning
+    for (const entry of ring) {
+      if (this._isCooling(entry.key_id, nowMs)) continue;
+
+      if (pool === "active") this.cursorActiveSeq = entry.seq;
+      else this.cursorUnknownSeq = entry.seq;
+
+      this._maybePersistCursor(nowMs);
+      this._setEphemeralCooldown(entry.key_id, nowMs + this.cfg.minIntervalMs);
+      return entry;
+    }
+
+    return null; // All cooling
   }
 
+  // ============================================================================
+  // Cooldown Handling (429)
+  // ============================================================================
+  _handleRateLimit(keyId, pool, ttlMs, nowMs) {
+    // Calculate streak
+    const existing = this.coolPersist[keyId] || { streak: 0, last_429_at: 0 };
+    let streak = existing.streak;
+    if (nowMs - existing.last_429_at > this.cfg.streakDecayMs) streak = 0;
+
+    const isUnknown = pool === "unknown";
+    const maxStreak = isUnknown ? this.cfg.unknownMaxStreak : this.cfg.activeMaxStreak;
+    const capMs = isUnknown ? this.cfg.unknownCapMs : this.cfg.activeCapMs;
+    streak = Math.min(streak, maxStreak);
+
+    ttlMs = ttlMs * Math.pow(2, streak);
+    ttlMs = Math.min(ttlMs, capMs);
+    ttlMs += Math.floor(ttlMs * 0.1 * Math.random()); // jitter
+
+    const entry = {
+      until_ms: nowMs + ttlMs,
+      streak: Math.min(streak + 1, maxStreak),
+      last_429_at: nowMs,
+    };
+
+    // Update memory
+    this.coolPersist[keyId] = entry;
+
+    // Sync write to SQL
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO cooldown (key_id, until_ms, streak, last_429_at) VALUES (?, ?, ?, ?)",
+      keyId,
+      entry.until_ms,
+      entry.streak,
+      entry.last_429_at,
+    );
+  }
+
+  // ============================================================================
+  // Refill from D1
+  // ============================================================================
   async _initialFillTimeboxed() {
     if (!this.refillInFlight) {
       const doFill = async () => {
@@ -274,7 +416,6 @@ export class KeyShard extends DurableObject {
       });
     }
 
-    // Timebox: we can't cancel D1 queries, but we can stop awaiting to keep request latency bounded.
     const timeout = new Promise((_, reject) =>
       setTimeout(() => reject(new Error("initial_fill_timeout")), this.cfg.initialFillTimeoutMs),
     );
@@ -286,12 +427,9 @@ export class KeyShard extends DurableObject {
     if (total >= minTotal) return;
 
     const need = minTotal - total;
-    // Prefer ACTIVE first, then UNKNOWN.
     let added = 0;
     added += await this._refillStatus(STATUS.ACTIVE, need);
     if (added < need) added += await this._refillStatus(STATUS.UNKNOWN, need - added);
-
-    if (added > 0) await this._persistRingsAndCursors();
   }
 
   async _refillStatus(status, want) {
@@ -301,8 +439,8 @@ export class KeyShard extends DurableObject {
     const lower = this.lower;
     const upper = this.upper;
 
-    let cursorKey = status === STATUS.ACTIVE ? this.cursorActiveKeyid : this.cursorUnknownKeyid;
-    if (!cursorKey) cursorKey = lower;
+    const cursorMetaKey = status === STATUS.ACTIVE ? "refill_cursor_active" : "refill_cursor_unknown";
+    let cursorKey = this._getMeta(cursorMetaKey) || lower;
 
     const limitBase = this.cfg.refillBatch * 2;
     const sql =
@@ -310,8 +448,13 @@ export class KeyShard extends DurableObject {
 
     let added = 0;
     let wrapped = false;
+    let poolFull = false;
+    let poolSize = status === STATUS.ACTIVE ? this.ringActive.length : this.ringUnknown.length;
+    const targetPool = status === STATUS.ACTIVE ? "active" : "unknown";
 
     while (added < want) {
+      if (poolSize >= this.cfg.maxPoolSize) break;
+
       const limit = Math.min(limitBase, (want - added) * 2);
       const res = await this.env.KEY_DB.prepare(sql).bind(status, lower, upper, cursorKey, limit).all();
       const rows = res.results || [];
@@ -323,83 +466,133 @@ export class KeyShard extends DurableObject {
         continue;
       }
 
-      // Always advance cursor to avoid re-scanning the same range even if we skip duplicates.
       cursorKey = rows[rows.length - 1].key_id;
 
-      for (const row of rows) {
-        if (added >= want) break;
-        const keyId = row.key_id;
-        if (this.activeSet.has(keyId) || this.unknownSet.has(keyId)) continue;
-        const entry = { key_id: keyId, key_plain: row.key_plain };
-        if (status === STATUS.ACTIVE) {
-          this.ringActive.push(entry);
-          this.activeSet.add(keyId);
-        } else {
-          this.ringUnknown.push(entry);
-          this.unknownSet.add(keyId);
+      // SQL write phase uses transactionSync
+      this.ctx.storage.transactionSync(() => {
+        for (const row of rows) {
+          if (added >= want) break;
+          if (poolSize >= this.cfg.maxPoolSize) {
+            poolFull = true;
+            break;
+          }
+          if (this.activeSet.has(row.key_id) || this.unknownSet.has(row.key_id)) continue;
+
+          this.ctx.storage.sql.exec(
+            "INSERT OR IGNORE INTO ring (key_id, key_plain, pool) VALUES (?, ?, ?)",
+            row.key_id,
+            row.key_plain,
+            targetPool,
+          );
+          const changed = this.ctx.storage.sql.exec("SELECT changes() AS n").one()?.n || 0;
+          if (changed > 0) {
+            added++;
+            poolSize++;
+            if (targetPool === "active") this.activeSet.add(row.key_id);
+            else this.unknownSet.add(row.key_id);
+          }
         }
-        added += 1;
-      }
+
+        this._setMeta(cursorMetaKey, cursorKey);
+      });
+      if (poolFull) break;
     }
 
-    if (status === STATUS.ACTIVE) this.cursorActiveKeyid = cursorKey;
-    else this.cursorUnknownKeyid = cursorKey;
-
+    if (added > 0) this._reloadRingsFromSQL();
     return added;
   }
 
-  async _persistRingsAndCursors() {
-    this._enforcePoolLimits();
-
-    // Clamp indices to current ring sizes.
-    if (this.ringActive.length > 0) this.cursorIdxActive %= this.ringActive.length;
-    if (this.ringUnknown.length > 0) this.cursorIdxUnknown %= this.ringUnknown.length;
-
-    try {
-      await this.ctx.storage.put({
-        ring_active: this.ringActive,
-        ring_unknown: this.ringUnknown,
-        cursor_active_keyid: this.cursorActiveKeyid,
-        cursor_unknown_keyid: this.cursorUnknownKeyid,
-        cursor_idx_active: this.cursorIdxActive,
-        cursor_idx_unknown: this.cursorIdxUnknown,
-      });
-    } catch (e) {
-      console.error(`[shard-${safeLogShard(this.shard)}] persist rings failed:`, e?.message || e);
-    }
+  _reloadRingsFromSQL() {
+    this.ringActive = this.ctx.storage.sql
+      .exec("SELECT seq, key_id, key_plain FROM ring WHERE pool='active' ORDER BY seq LIMIT ?", this.cfg.maxPoolSize)
+      .toArray();
+    this.ringUnknown = this.ctx.storage.sql
+      .exec("SELECT seq, key_id, key_plain FROM ring WHERE pool='unknown' ORDER BY seq LIMIT ?", this.cfg.maxPoolSize)
+      .toArray();
+    this._rebuildSets();
+    this._validateCursors();
   }
 
-  async _persistCoolMapIfDirty() {
-    if (!this.coolDirty) return;
-    this.coolDirty = false;
+  // ============================================================================
+  // Key Management
+  // ============================================================================
+  _promoteKey(keyId) {
+    this.ctx.storage.sql.exec("UPDATE ring SET pool = 'active' WHERE key_id = ?", keyId);
+    this._reloadRingsFromSQL();
+  }
 
-    try {
-      await this.ctx.storage.put("cool_map", this.coolPersist);
-    } catch (e) {
-      // Keep dirty so we retry later in alarm.
-      this.coolDirty = true;
-      console.error(`[shard-${safeLogShard(this.shard)}] persist cool_map failed:`, e?.message || e);
+  _removeKeyEverywhere(keyId) {
+    const wasInActive = this.activeSet.has(keyId);
+    const wasInUnknown = this.unknownSet.has(keyId);
+
+    // Always delete from SQL, even if this key is not currently in memory.
+    let sqlRingDeleted = 0;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM ring WHERE key_id = ?", keyId);
+      sqlRingDeleted = this.ctx.storage.sql.exec("SELECT changes() AS n").one()?.n || 0;
+      this.ctx.storage.sql.exec("DELETE FROM cooldown WHERE key_id = ?", keyId);
+    });
+
+    // Update memory only when this key is currently loaded.
+    if (wasInActive) {
+      this.ringActive = this.ringActive.filter((r) => r.key_id !== keyId);
     }
+    if (wasInUnknown) {
+      this.ringUnknown = this.ringUnknown.filter((r) => r.key_id !== keyId);
+    }
+    delete this.coolPersist[keyId];
+    this.coolEphemeral.delete(keyId);
+
+    if (wasInActive || wasInUnknown) {
+      this._rebuildSets();
+      this._validateCursors();
+    }
+
+    const found = wasInActive || wasInUnknown || sqlRingDeleted > 0;
+    return { found };
+  }
+
+  // ============================================================================
+  // Alarm
+  // ============================================================================
+  async _ensureAlarmScheduled() {
+    const current = await this.ctx.storage.getAlarm();
+    if (current != null) return;
+    const jitter = Math.floor(Math.random() * 60_000);
+    await this.ctx.storage.setAlarm(Date.now() + 300_000 + jitter);
+  }
+
+  async _scheduleAlarmSoon() {
+    const current = await this.ctx.storage.getAlarm();
+    const jitter = Math.floor(Math.random() * 30_000);
+    const target = Date.now() + 1_000 + jitter;
+    if (current == null || target < current) await this.ctx.storage.setAlarm(target);
   }
 
   async alarm() {
     const now = Date.now();
 
-    // Cleanup expired persisted cooldown entries.
+    // Cleanup expired cooldowns in SQL
+    this.ctx.storage.sql.exec("DELETE FROM cooldown WHERE until_ms <= ?", now);
+
+    // Also clean memory coolPersist
     for (const [keyId, v] of Object.entries(this.coolPersist)) {
-      if (!v || typeof v.until_ms !== "number") {
+      if (!v || typeof v.until_ms !== "number" || v.until_ms <= now) {
         delete this.coolPersist[keyId];
-        this.coolDirty = true;
-        continue;
-      }
-      if (v.until_ms <= now) {
-        delete this.coolPersist[keyId];
-        this.coolDirty = true;
       }
     }
-    await this._persistCoolMapIfDirty();
 
-    // Refill if needed.
+    // Flush any pending cursor
+    if (this.cursorDirtyCount > 0) {
+      this._flushCursors();
+      this.cursorDirtyCount = 0;
+      this.cursorLastFlush = now;
+    }
+
+    // Flush any pending expired cooldowns
+    this._flushExpiredCooldowns();
+
+    // Refill if needed
     const total = this.ringActive.length + this.ringUnknown.length;
     const target = Math.max(this.cfg.minPoolSize, this.cfg.targetHotPoolSize);
     if (total < target) {
@@ -410,7 +603,7 @@ export class KeyShard extends DurableObject {
       }
     }
 
-    // Reschedule next alarm (5 minutes base + jitter).
+    // Reschedule next alarm
     const jitter = Math.floor(Math.random() * 60_000);
     try {
       await this.ctx.storage.setAlarm(Date.now() + 300_000 + jitter);
@@ -419,6 +612,24 @@ export class KeyShard extends DurableObject {
     }
   }
 
+  // ============================================================================
+  // Shard Initialization
+  // ============================================================================
+  async _ensureShardFromRequest(req) {
+    const shard = (req.headers.get("x-shard") || "").toLowerCase();
+    if (!isValidHex2(shard)) throw new Error("missing_or_invalid_x-shard");
+
+    if (this.shard && this.shard !== shard) throw new Error("shard_mismatch");
+    if (!this.shard) {
+      this._setShard(shard);
+      this._setMeta("shard", shard);
+    }
+    return shard;
+  }
+
+  // ============================================================================
+  // HTTP Handler
+  // ============================================================================
   async fetch(req) {
     await this._ensureShardFromRequest(req);
 
@@ -428,12 +639,13 @@ export class KeyShard extends DurableObject {
       const now = Date.now();
 
       const fromActive = this._pickFromRing(this.ringActive, "active", now);
-      if (fromActive) return json({ ...fromActive, pool: "active" });
+      if (fromActive) return json({ key_id: fromActive.key_id, key_plain: fromActive.key_plain, pool: "active" });
 
       const fromUnknown = this._pickFromRing(this.ringUnknown, "unknown", now);
-      if (fromUnknown) return json({ ...fromUnknown, pool: "unknown" });
+      if (fromUnknown)
+        return json({ key_id: fromUnknown.key_id, key_plain: fromUnknown.key_plain, pool: "unknown" });
 
-      // Cold start: attempt a small synchronous fill, timeboxed.
+      // Cold start: attempt fill
       if (this.ringActive.length + this.ringUnknown.length === 0) {
         try {
           await this._initialFillTimeboxed();
@@ -443,9 +655,9 @@ export class KeyShard extends DurableObject {
         }
 
         const a2 = this._pickFromRing(this.ringActive, "active", now);
-        if (a2) return json({ ...a2, pool: "active" });
+        if (a2) return json({ key_id: a2.key_id, key_plain: a2.key_plain, pool: "active" });
         const u2 = this._pickFromRing(this.ringUnknown, "unknown", now);
-        if (u2) return json({ ...u2, pool: "unknown" });
+        if (u2) return json({ key_id: u2.key_id, key_plain: u2.key_plain, pool: "unknown" });
       }
 
       await this._scheduleAlarmSoon();
@@ -466,52 +678,21 @@ export class KeyShard extends DurableObject {
       if (outcome === "RATE_LIMIT") {
         let ttlMs = typeof payload.ttl_ms === "number" ? payload.ttl_ms : 60_000;
         ttlMs = clamp(ttlMs, 1_000, 86_400_000);
-
-        const isUnknown = pool === "unknown";
-        const maxStreak = isUnknown ? this.cfg.unknownMaxStreak : this.cfg.activeMaxStreak;
-        const capMs = isUnknown ? this.cfg.unknownCapMs : this.cfg.activeCapMs;
-
-        const entry = this.coolPersist[keyId] || { until_ms: 0, streak: 0, last_429_at: 0 };
-        const last429 = entry.last_429_at || 0;
-        // `streak` is an exponent used for the *current* multiplier.
-        // We store the *next* exponent (streak+1) after applying it.
-        // This means the first 429 uses multiplier 1 (2^0), then 2, 4, 8...
-        let streak = entry.streak || 0;
-        if (now - last429 > this.cfg.streakDecayMs) streak = 0;
-        streak = Math.min(streak, maxStreak);
-
-        ttlMs = ttlMs * Math.pow(2, streak);
-        ttlMs = Math.min(ttlMs, capMs);
-        ttlMs += Math.floor(ttlMs * 0.1 * Math.random()); // jitter
-
-        entry.until_ms = now + ttlMs;
-        entry.streak = Math.min(streak + 1, maxStreak);
-        entry.last_429_at = now;
-
-        this.coolPersist[keyId] = entry;
-        this.coolDirty = true;
-        await this._persistCoolMapIfDirty();
-
+        this._handleRateLimit(keyId, pool, ttlMs, now);
         return json({ ok: true });
       }
 
       if (outcome === "INVALID" || outcome === "QUOTA") {
         const removed = this._removeKeyEverywhere(keyId);
-        if (removed.changed) {
-          await this._persistRingsAndCursors();
-          await this._persistCoolMapIfDirty();
-        }
 
-        // Publish a state transition event (D1 updated asynchronously by queue consumer).
         const type = outcome === "INVALID" ? EVENT_TYPE.MARK_INVALID : EVENT_TYPE.MARK_QUOTA;
         const lastError = payload.error_code || "unknown";
         try {
           await this.env.KEY_EVENTS.send({ type, key_id: keyId, last_error: lastError });
         } catch {
-          // Best-effort: DO state is already updated; D1 will be eventually consistent via next events/admin.
+          // Best-effort
         }
 
-        // Ensure we refill soon if pool is running low.
         if (this.ringActive.length + this.ringUnknown.length < this.cfg.minPoolSize) {
           await this._scheduleAlarmSoon();
         }
@@ -520,33 +701,25 @@ export class KeyShard extends DurableObject {
       }
 
       if (outcome === "PROMOTE_OK") {
-        // Only promote if it is still in UNKNOWN ring; ignore if already promoted.
         if (this.unknownSet.has(keyId)) {
-          const entry = this._removeFromRing(this.ringUnknown, this.unknownSet, keyId);
-          if (entry) {
-            this.ringActive.push(entry);
-            this.activeSet.add(keyId);
-            await this._persistRingsAndCursors();
-            try {
-              await this.env.KEY_EVENTS.send({ type: EVENT_TYPE.PROMOTE_ACTIVE, key_id: keyId });
-            } catch {
-              // Best-effort.
-            }
+          this._promoteKey(keyId);
+          try {
+            await this.env.KEY_EVENTS.send({ type: EVENT_TYPE.PROMOTE_ACTIVE, key_id: keyId });
+          } catch {
+            // Best-effort
           }
         }
         return json({ ok: true });
       }
 
       if (outcome === "ERROR") {
-        // Transient upstream/network errors: short, ephemeral cooldown to spread load.
         let ttlMs =
           typeof payload.ttl_ms === "number"
             ? payload.ttl_ms
-            : 30_000 + Math.floor(Math.random() * 90_000); // 30s-120s
+            : 30_000 + Math.floor(Math.random() * 90_000);
         ttlMs = clamp(ttlMs, 1_000, 300_000);
         const until = now + ttlMs;
-        const prev = this.coolEphemeral.get(keyId) || 0;
-        if (until > prev) this.coolEphemeral.set(keyId, until);
+        this._setEphemeralCooldown(keyId, until);
         return json({ ok: true });
       }
 
@@ -558,52 +731,14 @@ export class KeyShard extends DurableObject {
       const ids = Array.isArray(payload?.key_ids) ? payload.key_ids : [];
       if (ids.length === 0) return badRequest("Provide key_ids");
 
-      let changed = false;
       let removed = 0;
       for (const id of ids) {
         const r = this._removeKeyEverywhere(String(id).toLowerCase());
         if (r.found) removed += 1;
-        if (r.changed) changed = true;
-      }
-      if (changed) {
-        await this._persistRingsAndCursors();
-        await this._persistCoolMapIfDirty();
       }
       return json({ ok: true, removed });
     }
 
     return json({ error: { message: "Not found" } }, { status: 404 });
-  }
-
-  _removeFromRing(ring, set, keyId) {
-    const idx = ring.findIndex((k) => k.key_id === keyId);
-    if (idx < 0) return null;
-    const [entry] = ring.splice(idx, 1);
-    set.delete(keyId);
-    return entry;
-  }
-
-  _removeKeyEverywhere(keyId) {
-    let found = false;
-    let changed = false;
-
-    const a = this._removeFromRing(this.ringActive, this.activeSet, keyId);
-    if (a) {
-      found = true;
-      changed = true;
-    }
-    const u = this._removeFromRing(this.ringUnknown, this.unknownSet, keyId);
-    if (u) {
-      found = true;
-      changed = true;
-    }
-
-    if (this.coolEphemeral.has(keyId)) this.coolEphemeral.delete(keyId);
-    if (this.coolPersist[keyId]) {
-      delete this.coolPersist[keyId];
-      changed = true;
-    }
-
-    return { found, changed };
   }
 }
