@@ -7,11 +7,7 @@ name = "KEY_SHARD"
 class_name = "KeyShardV2"
 
 [[migrations]]
-tag = "v3"
-new_classes = ["KeyShard"]
-
-[[migrations]]
-tag = "v4"
+tag = "v1"
 new_sqlite_classes = ["KeyShardV2"]
 
 [[d1_databases]]

@@ -50,13 +50,8 @@ export class KeyShardV2 extends DurableObject {
 
     // Initialize synchronously within blockConcurrencyWhile
     this.ctx.blockConcurrencyWhile(async () => {
-      try {
-        this._ensureSchema();
-        this._loadFromSQL();
-      } catch (e) {
-        console.error(`[shard-${safeLogShard(this.shard)}] init failed:`, e?.message || e);
-        this._resetInMemoryState();
-      }
+      this._ensureSchema();
+      this._loadFromSQL();
 
       try {
         await this._ensureAlarmScheduled();
@@ -64,21 +59,6 @@ export class KeyShardV2 extends DurableObject {
         console.error(`[shard-${safeLogShard(this.shard)}] init alarm failed:`, e?.message || e);
       }
     });
-  }
-
-  _resetInMemoryState() {
-    this.ringActive = [];
-    this.ringUnknown = [];
-    this.activeSet = new Set();
-    this.unknownSet = new Set();
-    this.coolPersist = {};
-    this.coolEphemeral = new Map();
-    this.coolExpiredPending = [];
-    this.cursorActiveSeq = 0;
-    this.cursorUnknownSeq = 0;
-    this.cursorDirtyCount = 0;
-    this.cursorLastFlush = 0;
-    this.refillInFlight = null;
   }
 
   _loadConfig(env) {
@@ -118,14 +98,25 @@ export class KeyShardV2 extends DurableObject {
   }
 
   // ============================================================================
-  // Schema Management (PRAGMA user_version)
+  // Schema Management (meta.schema_version)
   // ============================================================================
   _ensureSchema() {
-    const row = this.ctx.storage.sql.exec("PRAGMA user_version").one();
-    const version = row?.user_version || 0;
+    this.ctx.storage.transactionSync(() => {
+      // Create meta table first so schema version reads/writes are always safe.
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS meta (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        )
+      `);
 
-    if (version < 1) {
-      this.ctx.storage.transactionSync(() => {
+      const versionRow = this.ctx.storage.sql
+        .exec("SELECT value FROM meta WHERE key = 'schema_version'")
+        .one();
+      const parsed = Number.parseInt(versionRow?.value ?? "0", 10);
+      const version = Number.isFinite(parsed) ? parsed : 0;
+
+      if (version < 1) {
         this.ctx.storage.sql.exec(`
           CREATE TABLE IF NOT EXISTS ring (
             seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,18 +134,14 @@ export class KeyShardV2 extends DurableObject {
           )
         `);
         this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_cooldown_until ON cooldown(until_ms)");
-        this.ctx.storage.sql.exec(`
-          CREATE TABLE IF NOT EXISTS meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-          )
-        `);
         this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_ring_pool_seq ON ring(pool, seq)");
-        this.ctx.storage.sql.exec("PRAGMA user_version = 1");
-      });
-    }
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '1')",
+        );
+      }
+    });
 
-    // Future migrations: if (version < 2) { ... PRAGMA user_version = 2; }
+    // Future migrations: if (version < 2) { ... update schema_version to 2; }
   }
 
   // ============================================================================
