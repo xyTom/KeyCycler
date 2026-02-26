@@ -42,14 +42,13 @@ export async function handleProxyRequest(req, env, ctx) {
     if (upstream.status === 401 || upstream.status === 403) {
       const clone = upstream.clone();
       const code = await readUpstreamErrorCode(clone);
-      if (code === "invalid_api_key") {
-        await durableReport(env, shard, { key_id: keyId, pool, outcome: "INVALID", error_code: code });
-        continue;
-      }
       if (code === "insufficient_quota") {
         await durableReport(env, shard, { key_id: keyId, pool, outcome: "QUOTA", error_code: code });
         continue;
       }
+      // All other 401/403 errors (invalid_api_key, account_deactivated, etc.) → treat key as invalid
+      await durableReport(env, shard, { key_id: keyId, pool, outcome: "INVALID", error_code: code || "unknown_auth_error" });
+      continue;
     }
 
     // Upstream/server/network errors are usually not key-specific; do not retry.
